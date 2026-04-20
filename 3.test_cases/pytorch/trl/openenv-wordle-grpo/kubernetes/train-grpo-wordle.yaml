@@ -2,12 +2,6 @@
 # SPDX-License-Identifier: MIT-0
 
 # GRPO Wordle Training on SageMaker HyperPod (EKS) - Single Node, Multi-GPU (4x L40S)
-#
-# HyperPod features:
-#   - Auto-resume: restarts the job on a healthy node after hardware failure
-#   - Health checks: only schedules on nodes that pass deep health checks
-#   - FSx for Lustre: shared storage survives node replacements
-#
 # Option 1: vLLM colocate mode (1 GPU, all 4 available)
 #   - vLLM and training share the same GPU; simpler, lower throughput
 #   - Set VLLM_MODE=colocate, CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -16,11 +10,6 @@
 #   - GPU 0 runs a dedicated vLLM server for fast generation
 #   - GPUs 1-3 run FSDP-sharded GRPO training
 #   - Higher throughput, supports larger models
-#
-# Prerequisites:
-#   - SageMaker HyperPod EKS cluster with the HyperPod Helm chart installed
-#     (bundles Training Operator, NVIDIA device plugin, health monitoring agents)
-#
 # Usage:
 #   envsubst < train-grpo-wordle.yaml | kubectl apply -f -
 
@@ -36,7 +25,6 @@ metadata:
     sagemaker.amazonaws.com/job-max-retry-count: "3"
 spec:
   restartPolicy: OnFailure
-  # HyperPod node-health toleration
   tolerations:
     - key: sagemaker.amazonaws.com/node-health-status
       operator: Exists
@@ -75,7 +63,10 @@ spec:
       - name: PYTORCH_CUDA_ALLOC_CONF
         value: "expandable_segments:True,garbage_collection_threshold:0.6"
       - name: HF_TOKEN
-        value: $HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-token
+            key: token
       - name: HF_HOME
         value: "/fsx/hf_cache"
       - name: CUDA_VISIBLE_DEVICES
@@ -109,8 +100,9 @@ spec:
           mountPath: /fsx
   volumes:
     - name: shmem
-      hostPath:
-        path: /dev/shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
     - name: fsx-storage
       persistentVolumeClaim:
         claimName: ${FSX_PVC}

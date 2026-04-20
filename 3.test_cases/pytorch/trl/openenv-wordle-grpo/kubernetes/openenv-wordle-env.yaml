@@ -23,7 +23,6 @@ spec:
       labels:
         app: openenv-wordle
     spec:
-      # HyperPod node-health toleration
       tolerations:
         - key: sagemaker.amazonaws.com/node-health-status
           operator: Exists
@@ -39,6 +38,8 @@ spec:
                       - Schedulable
       containers:
       - name: wordle-env
+        # NOTE: This image is externally managed by the HuggingFace Space owner
+        # and may change without notice. No versioned tags are available.
         image: registry.hf.space/burtenshaw-wordle:latest
         ports:
         - containerPort: 8000

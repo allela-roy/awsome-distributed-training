@@ -80,7 +80,11 @@ For more details, see the [OpenEnv documentation](https://meta-pytorch.org/OpenE
 │  │  /health           │     │                              │ │
 │  └────────────────────┘     └──────────────────────────────┘ │
 │                                                              │
-
+│  HyperPod features:                                          │
+│    - Node health monitoring + deep health checks             │
+│    - Job auto-resume on hardware failure                     │
+│    - Automatic node replacement                              │
+│                                                              │
 │  ┌──────────────────────────────────────────────────────────┐│
 │  │ FSx for Lustre (/fsx)                                   ││
 │  │  /fsx/hf_cache          — HuggingFace model cache       ││
@@ -105,7 +109,7 @@ For more details, see the [OpenEnv documentation](https://meta-pytorch.org/OpenE
    kubectl get daemonset -n kube-system dependencies-nvidia-device-plugin
    ```
 
-5. **Docker**  for building container images.
+5. **Docker** with BuildKit support for building container images.
 
 6. **HuggingFace token** with read access for gated model downloads.
 
@@ -138,8 +142,6 @@ hyperpod-i-0a1b2c3d4e5f67890   Ready    <none>   2d    v1.33.5-eks-ecaa3a6   Sch
 hyperpod-i-0f9e8d7c6b5a43210   Ready    <none>   2d    v1.33.5-eks-ecaa3a6   Schedulable          ml.g6.12xlarge
 ```
 
-> **Note:** All nodes should show `Ready` status and `Schedulable` health status. If nodes show `NotReady`, the kubelet may need to be restarted. For fresh clusters, allow 10-15 minutes after node provisioning for the lifecycle scripts to complete.
-
 ### Clone the repository
 
 ```bash
@@ -157,7 +159,17 @@ cp env_vars.example env_vars
 source env_vars
 ```
 
-### 1.2. Build and push the container image
+### 1.2. Create the HuggingFace token secret
+
+Store your HuggingFace token in a Kubernetes Secret (used by all training and inference manifests):
+
+```bash
+kubectl create secret generic hf-token \
+  --from-literal=token=$HF_TOKEN \
+  --namespace=$NAMESPACE
+```
+
+### 1.3. Build and push the container image
 
 Build the image (takes ~15-20 minutes on first build):
 
@@ -202,7 +214,7 @@ latest: digest: sha256:2d2cac478f72... size: 856
 The Wordle environment runs as a CPU-only Kubernetes Deployment with 2 replicas behind a ClusterIP service:
 
 ```bash
-envsubst < kubernetes/openenv-wordle-env.yaml | kubectl apply -f -
+envsubst '$NAMESPACE $REGISTRY $IMAGE $TAG' < kubernetes/openenv-wordle-env.yaml | kubectl apply -f -
 ```
 
 Verify the environment is running:
@@ -231,6 +243,9 @@ kubectl run test-env --rm -it --restart=Never \
   curl -s http://openenv-wordle:7860/health
 # Expected: {"status": "healthy"}
 ```
+
+> **Note:** You can also skip the local deployment and use the public HuggingFace Space instead by setting `--env-url https://burtenshaw-wordle.hf.space` in the training command. The local deployment avoids rate limits and provides lower latency.
+
 ## 3. Launch GRPO Training
 
 ### 3.1. Single-GPU / Colocate Mode
@@ -239,7 +254,7 @@ The simplest option: vLLM and GRPO training share the same GPU. Good for models 
 
 ```bash
 source env_vars
-envsubst < kubernetes/train-grpo-wordle.yaml | kubectl apply -f -
+envsubst '$NAMESPACE $REGISTRY $IMAGE $TAG $INSTANCE_TYPE $MODEL_NAME $VLLM_MODE $NUM_GPU_PER_NODE $NUM_GENERATIONS $GRADIENT_ACCUMULATION_STEPS $LEARNING_RATE $FSX_PVC' < kubernetes/train-grpo-wordle.yaml | kubectl apply -f -
 ```
 
 ### 3.2. Monitor training
@@ -252,7 +267,7 @@ kubectl get pod grpo-wordle -w
 kubectl logs grpo-wordle -f
 
 # Check checkpoints
-kubectl exec fsx-storage-manager -- ls -la /fsx/checkpoints/wordle-grpo/
+kubectl exec grpo-wordle -- ls -la /fsx/checkpoints/wordle-grpo/
 ```
 
 Example training output:
@@ -296,12 +311,12 @@ For higher throughput and larger models, split inference and training across GPU
 
 ```bash
 source env_vars
-envsubst < kubernetes/train-grpo-wordle-multigpu.yaml | kubectl apply -f -
+envsubst '$NAMESPACE $REGISTRY $IMAGE $TAG $INSTANCE_TYPE $MODEL_NAME $NUM_GENERATIONS $GRADIENT_ACCUMULATION_STEPS $LEARNING_RATE $FSX_PVC' < kubernetes/train-grpo-wordle-multigpu.yaml | kubectl apply -f -
 ```
 
 The pod runs two containers:
-- **vllm-server**: Starts a vLLM server on GPU 0, serving the model for fast rollout generation
-- **trainer**: Waits for the vLLM server, then launches Accelerate with 3 processes for FSDP training
+- **vllm-server**: Starts a vLLM server on GPU 0 (1 GPU), serving the model for fast rollout generation
+- **trainer**: Waits for the vLLM server, then launches Accelerate with 3 processes for FSDP training on GPUs 1-3 (3 GPUs)
 
 ### 4.1. Monitor multi-GPU training
 
@@ -328,7 +343,7 @@ After training completes, deploy an inference pod to test the trained model:
 
 ```bash
 source env_vars
-envsubst < kubernetes/inference-wordle.yaml | kubectl apply -f -
+envsubst '$NAMESPACE $REGISTRY $IMAGE $TAG $INSTANCE_TYPE $MODEL_NAME $FSX_PVC' < kubernetes/inference-wordle.yaml | kubectl apply -f -
 ```
 
 Interactive inference:
@@ -356,9 +371,11 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 ```bash
 # Stop all pods
-kubectl delete pod grpo-wordle grpo-wordle-multigpu inference-wordle fsx-storage-manager 2>/dev/null
+kubectl delete pod grpo-wordle grpo-wordle-multigpu inference-wordle 2>/dev/null
 kubectl delete -f kubernetes/openenv-wordle-env.yaml
+kubectl delete secret hf-token 2>/dev/null
 ```
+
 
 ## Configuration Reference
 

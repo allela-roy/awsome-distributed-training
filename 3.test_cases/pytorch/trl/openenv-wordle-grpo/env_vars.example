@@ -6,7 +6,7 @@ export AWS_REGION=$(aws ec2 describe-availability-zones --output text --query 'A
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export REGISTRY=${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/
 export IMAGE=openenv-wordle-grpo
-export TAG=latest
+export TAG=v1.0
 
 # SageMaker HyperPod EKS cluster
 export HYPERPOD_CLUSTER_NAME="<your-hyperpod-cluster-name>"

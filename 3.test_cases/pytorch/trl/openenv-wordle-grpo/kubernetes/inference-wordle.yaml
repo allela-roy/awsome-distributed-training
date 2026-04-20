@@ -50,7 +50,10 @@ spec:
           memory: "60Gi"
       env:
       - name: HF_TOKEN
-        value: $HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-token
+            key: token
       - name: HF_HOME
         value: "/fsx/hf_cache"
       command:
@@ -92,8 +95,9 @@ spec:
           mountPath: /fsx
   volumes:
     - name: shmem
-      hostPath:
-        path: /dev/shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
     - name: fsx-storage
       persistentVolumeClaim:
         claimName: ${FSX_PVC}
