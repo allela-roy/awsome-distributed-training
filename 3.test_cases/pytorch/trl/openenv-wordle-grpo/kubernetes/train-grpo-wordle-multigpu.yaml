@@ -83,6 +83,8 @@ spec:
         - --model
         - $MODEL_NAME
         - --host
+        # Binds to all interfaces to allow kubelet readiness probes (which connect
+        # via pod IP). Access is limited to the cluster network (no Service exposed).
         - "0.0.0.0"
         - --port
         - "8000"
@@ -123,6 +125,7 @@ spec:
         - "/bin/bash"
         - "-c"
         - |
+          set -euo pipefail
           # Wait for vLLM server to be ready
           echo "Waiting for vLLM server..."
           until curl -sf http://localhost:8000/health; do

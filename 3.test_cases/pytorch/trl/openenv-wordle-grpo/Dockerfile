@@ -36,6 +36,14 @@ src = p.read_text(); \
 src = src.replace('logprobs_mode=\"processed_logprobs\",\n', ''); \
 p.write_text(src)"
 
+# Verify the TRL patch was applied successfully (fail the build if it wasn't)
+RUN python -c "\
+import pathlib; \
+p = pathlib.Path('/opt/miniconda3/lib/python3.12/site-packages/trl/trainer/grpo_trainer.py'); \
+src = p.read_text(); \
+assert 'logprobs_mode=\"processed_logprobs\"' not in src, \
+    'ERROR: TRL patch failed to apply. The logprobs_mode kwarg is still present in grpo_trainer.py'"
+
 # Flash Attention (requires torch, must install separately with --no-build-isolation)
 RUN pip install "flash-attn>=2.5.0,<3.0" --no-build-isolation
 

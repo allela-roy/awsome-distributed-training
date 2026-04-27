@@ -60,6 +60,7 @@ spec:
         - "/bin/bash"
         - "-c"
         - |
+          set -euo pipefail
           python -c "
           import torch
           from transformers import AutoModelForCausalLM, AutoTokenizer
