@@ -45,9 +45,11 @@ as a separate stack, then pass its output to the cluster.
   the default `PostInstallScriptUrl` delivers.
 - **Pre-baked AMI** — build the AMI separately (see the README's
   *Pre-baking Enroot/Pyxis into a custom AMI* section), then pass its `ami-xxx` as
-  the cluster's `AmiId`. Use `PostInstallScriptUrl=""` for the cleanest boot (the
-  installer is idempotent so leaving the default is a fast no-op, but skipping the
-  download saves a few seconds on every node launch).
+  the cluster's `AmiId`. Set `PostInstallScriptUrl=' '` (a single space) for the
+  cleanest boot — that skips the Enroot/Pyxis install entirely. (Leaving it at the
+  default — empty, which auto-installs from the templates bucket — also works on a
+  pre-baked AMI: the installer is idempotent and detects Enroot/Pyxis is already
+  present, a fast no-op; the single space just avoids the download+check.)
 
 ### 2.1 The AMI is single-Slurm-version, by design
 
@@ -135,7 +137,7 @@ want — leave it alone.
 
 ### 3.2 Public Grafana exposure
 
-`GrafanaPublicAccessCidr` opens **TCP/443 on the login node** to a CIDR via a
+`GrafanaAccessCidr` opens **TCP/443 on the login node** to a CIDR via a
 login-only security group. The nginx in front of Grafana also proxies
 **`/prometheus/`, `/pushgateway/`, `/slurmexporter/` without authentication** — opening
 the CIDR exposes those too, not just password-gated Grafana. Use the tightest CIDR you
@@ -168,8 +170,8 @@ on the deployment type**:
 |---|---|---|
 | Lustre | `PERSISTENT_2` (default) | 125 / 250 / 500 / 1000 MB/s/TiB |
 | Lustre | `PERSISTENT_1` (older Regions) | 50 / 100 / 200 MB/s/TiB |
-| OpenZFS | `SINGLE_AZ_HA_2` (default) | 160 / 320 / 640 / 1280 / 2560 / 3840 / 5120 / 7680 MB/s |
-| OpenZFS | `SINGLE_AZ_HA_1` / `SINGLE_AZ_2` / `SINGLE_AZ_1` | 64 / 128 / 192 / 256 / 384 / 512 / 768 / 1024 MB/s |
+| OpenZFS | `SINGLE_AZ_2` / `SINGLE_AZ_HA_2` (default) | 160 / 320 / 640 / 1280 / 2560 / 3840 / 5120 / 7680 / 10240 MB/s |
+| OpenZFS | `SINGLE_AZ_HA_1` / `SINGLE_AZ_1` | 64 / 128 / 256 / 512 / 1024 / 2048 / 3072 / 4096 MB/s |
 
 The templates enforce the valid pair via CloudFormation `Rules` so a mismatch fails at
 stack-create time with a clear message instead of deep in the nested FSx stack. If you
@@ -425,5 +427,5 @@ For a new production deploy:
   and pass its output as `AmiId` (~3 min boot vs ~6 min). Match `SlurmVersion` between
   the AMI build stack and the cluster stack.
 - Default `DcgmExporterImage` covers H100/B200/B300; override only to pin a different build
-- Minimum-CIDR `GrafanaPublicAccessCidr` if used at all; otherwise empty (SSM port-forward)
+- Minimum-CIDR `GrafanaAccessCidr` if used at all; otherwise empty (SSM port-forward)
 - Throughput values that match the chosen FSx deployment types

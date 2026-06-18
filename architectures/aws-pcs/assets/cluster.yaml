@@ -159,17 +159,65 @@ Resources:
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      # Instance-role permissions are inline (PutRolePolicy), NOT a separate
+      # AWS::IAM::ManagedPolicy — so deploying this stack needs only
+      # iam:CreateRole + iam:PutRolePolicy (which the cluster-admin policy
+      # grants), never iam:CreatePolicy. Split by feature so monitoring and
+      # multi-user don't depend on each other:
       Policies:
-        - PolicyName: PcsRegisterInstancePolicy
+        # Always present (every cluster): register with PCS + read boot scripts
+        # from S3 + read this cluster's own SSM parameters (grafana password,
+        # ldap admin password) + decrypt SSM SecureStrings. None of this is
+        # monitoring- or directory-specific; it is the baseline an instance
+        # needs to register, fetch its post-install/directory scripts, and
+        # store/read the per-cluster secrets it generates.
+        - PolicyName: PcsInstanceBasePolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
+              - Sid: PcsRegisterInstance
+                Effect: Allow
                 Action:
                   - pcs:RegisterComputeNodeGroupInstance
                 Resource: "*"
 
-  # IAM Instance Profile
+              # (Boot-script reads from S3 are already covered by the attached
+              # AmazonS3ReadOnlyAccess managed policy, so no inline s3:GetObject
+              # statement is needed here. See note on AmazonS3ReadOnlyAccess above.)
+
+              # Compute nodes run untrusted user jobs and must NOT be able to read
+              # the OpenLDAP admin password, so the base policy grants the grafana
+              # parameter only. The ldap/* SSM read/write + KMS decrypt live on a
+              # separate login-only role (PcsLoginInstanceIamRole) below — see the
+              # security review on the multi-user PR. SSSD on compute uses an
+              # anonymous bind, so compute never needs the ldap secret.
+              - Sid: SSMGrafanaParameterForThisClusterOnly
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:AddTagsToResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pcs/${PCSCluster.Id}/grafana/*'
+
+              # Hard-deny the OpenLDAP admin password on the shared/compute role.
+              # AmazonSSMManagedInstanceCore (attached for SSM agent) grants
+              # ssm:GetParameter on "*", and the SecureString is encrypted with the
+              # AWS-managed key alias/aws/ssm — whose key policy lets any in-account
+              # principal decrypt via SSM. So WITHOUT this explicit Deny a user job on
+              # a compute node could `get-parameter --with-decryption` the directory
+              # admin password (directory takeover). An explicit Deny overrides the
+              # managed-policy Allow. The login-only role does NOT carry this Deny.
+              - Sid: DenyLdapAdminPasswordOnComputeNodes
+                Effect: Deny
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pcs/${PCSCluster.Id}/ldap/*'
+
+  # IAM Instance Profile (compute + login share this base profile)
   PcsInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -179,14 +227,86 @@ Resources:
       Roles:
         - !Ref PcsInstanceIamRole
 
-  # Monitoring IAM Policy (optional, attached to the instance role)
-  MonitoringPolicy:
-    Type: AWS::IAM::ManagedPolicy
+  # Login-node-only role: the base role plus the OpenLDAP admin password
+  # (ssm /pcs/<id>/ldap/*) read/write and KMS decrypt. Only the login node runs
+  # the OpenLDAP server and needs this secret; keeping it off the compute role
+  # prevents a user job on a compute node from reading the directory admin
+  # password via IMDS (directory-takeover). deploy-all passes this profile to the
+  # LoginNodeGroupStack only; every other CNG gets PcsInstanceProfile.
+  PcsLoginInstanceIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - 'AWSPCS-pcs-login-${StackHash}-${AWS::Region}-role'
+        - StackHash: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Description: "AWS IAM role for the PCS login node (adds OpenLDAP admin secret access)"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      Policies:
+        - PolicyName: PcsLoginInstancePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PcsRegisterInstance
+                Effect: Allow
+                Action:
+                  - pcs:RegisterComputeNodeGroupInstance
+                Resource: "*"
+
+              # (Boot-script reads from S3 are covered by AmazonS3ReadOnlyAccess;
+              # no inline s3:GetObject needed — same as the base role.)
+
+              - Sid: SSMClusterParametersForThisClusterOnly
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:AddTagsToResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pcs/${PCSCluster.Id}/grafana/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pcs/${PCSCluster.Id}/ldap/*'
+
+              - Sid: KMSForSSMSecureString
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+
+  PcsLoginInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DependsOn: PcsLoginInstanceIamRole
+    Properties:
+      InstanceProfileName: !Sub
+        - 'AWSPCS-pcs-login-${StackHash}-${AWS::Region}'
+        - StackHash: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Roles:
+        - !Ref PcsLoginInstanceIamRole
+
+  # Monitoring instance permissions — inline policy added to the instance role
+  # only when monitoring is enabled. Inline (RoleName + PutRolePolicy via an
+  # AWS::IAM::Policy) instead of a ManagedPolicy, so the deployer never needs
+  # iam:CreatePolicy. Holds ONLY monitoring-specific reads (Prometheus service
+  # discovery + cost/CloudWatch metrics); multi-user/SSM/S3 perms live in the
+  # always-on base policy above.
+  MonitoringInstancePolicy:
+    Type: AWS::IAM::Policy
     Condition: IsMonitoringEnabled
     Properties:
-      ManagedPolicyName: !Sub '${PCSCluster.Id}-monitoring-policy'
+      PolicyName: !Sub '${PCSCluster.Id}-monitoring'
       Roles:
         - !Ref PcsInstanceIamRole
+        - !Ref PcsLoginInstanceIamRole
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -225,23 +345,6 @@ Resources:
               - pricing:DescribeServices
             Resource: '*'
 
-          - Sid: SSMGrafanaPasswordForThisClusterOnly
-            Effect: Allow
-            Action:
-              - ssm:GetParameter
-              - ssm:PutParameter
-              - ssm:AddTagsToResource
-            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pcs/${PCSCluster.Id}/grafana/*'
-
-          - Sid: KMSForSSMSecureString
-            Effect: Allow
-            Action:
-              - kms:Decrypt
-            Resource: '*'
-            Condition:
-              StringEquals:
-                kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
-
           - Sid: CloudWatchGetMetricData
             Effect: Allow
             Action:
@@ -275,8 +378,11 @@ Outputs:
     Description: The Id of the PCS cluster
     Value: !GetAtt [ PCSCluster, Id ]
   InstanceProfileArn:
-    Description: ARN of the IAM instance profile
+    Description: ARN of the IAM instance profile (compute node groups)
     Value: !GetAtt [ PcsInstanceProfile, Arn ]
+  LoginInstanceProfileArn:
+    Description: ARN of the login-node IAM instance profile (adds ldap/* SSM + KMS decrypt)
+    Value: !GetAtt [ PcsLoginInstanceProfile, Arn ]
   RoleName:
     Description: IAM Role name for cluster instances
     Value: !Ref PcsInstanceIamRole
