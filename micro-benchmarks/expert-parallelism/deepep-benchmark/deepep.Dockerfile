@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=13.0.2
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
 ################################ NCCL ########################################
@@ -26,7 +26,7 @@ RUN rm -rf /opt/hpcx \
 
 ENV OPAL_PREFIX=
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
+RUN apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
     apt-utils \
     autoconf \
     automake \
@@ -145,13 +145,19 @@ ENV NVSHMEM_LIBFABRIC_PROVIDER=efa
 
 ################################ PyTorch ########################################
 
-RUN /opt/deepep/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128 \
-    && /opt/deepep/bin/pip uninstall -y nvidia-nvshmem-cu12 \
+RUN /opt/deepep/bin/pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130 \
+    && /opt/deepep/bin/pip uninstall -y nvidia-nvshmem-cu13 nvidia-nvshmem-cu12 \
     && /opt/deepep/bin/pip install ninja numpy cmake pytest
 
 ################################ DeepEP ########################################
 
 ARG DEEPEP_COMMIT=567632d
+
+# CUDA architecture(s) to build NVSHMEM and DeepEP for, semicolon-separated:
+# 90 = Hopper (H100, sm_90), 100 = Blackwell (B200/B300, sm_100). Defaults to
+# both so one image runs on Hopper and Blackwell; override with e.g.
+# --build-arg GPU_ARCH=90 to build a smaller Hopper-only image.
+ARG GPU_ARCH="90;100"
 
 RUN git clone https://github.com/deepseek-ai/DeepEP.git /DeepEP \
     && cd /DeepEP \
@@ -161,7 +167,7 @@ RUN /tmp/setup_deepep_efa.sh \
     --cuda-home /usr/local/cuda \
     --libfabric-home /opt/amazon/efa \
     --gdrcopy-home /opt/gdrcopy \
-    --gpu-arch 90 \
+    --gpu-arch "${GPU_ARCH}" \
     --venv /opt/deepep \
     --deepep-src /DeepEP \
     --nvshmem-src ${NVSHMEM_SRC}
