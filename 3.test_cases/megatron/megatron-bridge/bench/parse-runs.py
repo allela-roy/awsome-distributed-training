@@ -37,6 +37,11 @@ RE_TFLOPS = re.compile(r"(?:throughput per GPU \(TFLOP/s/GPU\)|TFLOP/s/GPU|tflop
 RE_GBS = re.compile(r"global batch size:\s*(\d+)")
 RE_EFA = re.compile(r"Selected provider is efa")
 RE_UCCL = re.compile(r"Registered proxies|high-throughput mode")
+# NVSHMEM init banner (NVIDIA DeepEP arm). Must be NVSHMEM-SPECIFIC — the generic
+# "libfabric ... efa" string also appears in the NCCL/aws-ofi init of every arm, so we key
+# only on NVSHMEM's own version/init lines (e.g. "NVSHMEM v3.7.0"). This is the analogue of
+# RE_UCCL for the UCCL arm. The hard EFA gate (RE_EFA) still applies to ALL arms.
+RE_NVSHMEM = re.compile(r"NVSHMEM INFO|nvshmem_init|Initializing NVSHMEM|NVSHMEM v[0-9]")
 
 
 def parse_run(run_dir, warmup, debug=False):
@@ -55,7 +60,7 @@ def parse_run(run_dir, warmup, debug=False):
     iter_log = max(logs, key=_rank)              # last node: per-iteration training lines
     rank0_log = min(logs, key=_rank)             # first node: EFA / UCCL-proxy init signals
     iters = []  # (iter, loss, time_s, tflops, gbs)
-    efa_ok = uccl_ok = False
+    efa_ok = uccl_ok = nvshmem_ok = False
     for sig_log in {rank0_log, iter_log}:
         with open(sig_log, errors="replace") as f:
             for line in f:
@@ -63,6 +68,8 @@ def parse_run(run_dir, warmup, debug=False):
                     efa_ok = True
                 if RE_UCCL.search(line):
                     uccl_ok = True
+                if RE_NVSHMEM.search(line):
+                    nvshmem_ok = True
     with open(iter_log, errors="replace") as f:
         for line in f:
             mi = RE_ITER.search(line)
@@ -90,7 +97,14 @@ def parse_run(run_dir, warmup, debug=False):
     times = [r[2] for r in steady if r[2] == r[2]]
     tfs = [r[3] for r in steady if r[3] == r[3]]
     gbs = next((r[4] for r in iters if r[4]), 0)
+    # Sequence length for the tok/s derivation: read it from env.txt (recorded as "seq=NNNN")
+    # rather than hardcoding, so a SEQ_LEN override doesn't silently skew derived tok/s.
     seq = 4096
+    _envp = os.path.join(run_dir, "env.txt")
+    if os.path.isfile(_envp):
+        _m = re.search(r"\bseq=(\d+)", open(_envp, errors="replace").read())
+        if _m:
+            seq = int(_m.group(1))
     n = len(times)
     mean_t = sum(times) / n if n else float("nan")
     med_t = sorted(times)[n // 2] if n else float("nan")
@@ -110,6 +124,7 @@ def parse_run(run_dir, warmup, debug=False):
         "stalls": stalls,
         "efa_ok": efa_ok,
         "uccl_ok": uccl_ok,
+        "nvshmem_ok": nvshmem_ok,
     }
 
 
@@ -148,37 +163,43 @@ def main():
         sp = os.path.join(run_dir, "STATUS")
         if os.path.isfile(sp):
             status = open(sp).read().strip().replace("\n", " ")
+        # backend (uccl|nvshmem|"") labels the deepep transport for the 3-way comparison;
+        # arm_label is the full per-run label (e.g. deepep-nvshmem-ep32). Both come from
+        # env.txt (older runs without them fall back to deriving from the run tag).
         rows.append({
             "model": model, "run": tag,
             "arm": env.get("arm", tag.split("-")[0]),
+            "arm_label": env.get("arm_label", tag.split("-mb")[0]),
+            "backend": env.get("ep_backend", ""),
+            "ep": env.get("EP", ""),
             "mb": env.get("mb", ""), "overlap": env.get("overlap", ""),
             "mean_iter_s": "%.4f" % s["mean_iter_s"],
             "median_iter_s": "%.4f" % s["median_iter_s"],
             "tflops_per_gpu": "%.2f" % s["tflops_per_gpu"],
             "tok_s": "%.1f" % s["tok_s"],
             "stalls": s["stalls"], "n_steady": s["n_steady"],
-            "efa_ok": s["efa_ok"], "uccl_ok": s["uccl_ok"],
+            "efa_ok": s["efa_ok"], "uccl_ok": s["uccl_ok"], "nvshmem_ok": s["nvshmem_ok"],
             "git_rev": env.get("git_rev", ""), "status": status,
         })
 
     if not rows:
         sys.exit("no runs with logs/rank-0.log found under %s" % campaign)
-    cols = ["model", "run", "arm", "mb", "overlap", "mean_iter_s", "median_iter_s",
-            "tflops_per_gpu", "tok_s", "stalls", "n_steady", "efa_ok", "uccl_ok",
-            "git_rev", "status"]
+    cols = ["model", "run", "arm", "arm_label", "backend", "ep", "mb", "overlap",
+            "mean_iter_s", "median_iter_s", "tflops_per_gpu", "tok_s", "stalls",
+            "n_steady", "efa_ok", "uccl_ok", "nvshmem_ok", "git_rev", "status"]
     idx = os.path.join(campaign, "index.csv")
     with open(idx, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
     sys.stderr.write("wrote %s (%d runs)\n" % (idx, len(rows)))
-    # echo a readable table to stdout
-    print("%-8s %-22s %10s %10s %8s %6s %7s %7s" %
-          ("model", "run", "mean_s", "tflop/gpu", "tok/s", "stalls", "efa", "uccl"))
+    # echo a readable table to stdout (one shared fmt so header and rows always align)
+    _FMT = "%-10s %-28s %8s %9s %10s %10s %6s %6s %9s"
+    print(_FMT % ("model", "run", "backend", "mean_s", "tflop/gpu", "tok/s", "efa", "stalls", "transport"))
     for r in rows:
-        print("%-8s %-22s %10s %10s %8s %6s %7s %7s" %
-              (r["model"], r["run"], r["mean_iter_s"], r["tflops_per_gpu"],
-               r["tok_s"], r["stalls"], r["efa_ok"], r["uccl_ok"]))
+        transport = "uccl" if r["uccl_ok"] else ("nvshmem" if r["nvshmem_ok"] else "-")
+        print(_FMT % (r["model"], r["run"], r["backend"] or "-", r["mean_iter_s"],
+                      r["tflops_per_gpu"], r["tok_s"], r["efa_ok"], r["stalls"], transport))
 
 
 if __name__ == "__main__":
